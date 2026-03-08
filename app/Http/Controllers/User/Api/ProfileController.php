@@ -1,0 +1,322 @@
+<?php
+
+namespace App\Http\Controllers\User\Api;
+
+use App\Http\Controllers\Controller;
+use App\Http\Requests\ChangePasswordRequest;
+use App\Models\BankAccount;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Hash;
+use App\Models\Document;
+use Exception;
+use Illuminate\Support\Facades\Storage;
+use App\Http\Resources\UserResource;
+
+class ProfileController extends Controller
+{
+    public function updateProfile(Request $request)
+    {
+        try {
+            $validated = $request->validate([
+                'address' => 'nullable|string|max:255',
+                'city' => 'nullable|string|max:100',
+                'zip_code' => 'nullable|string|max:20',
+                'image' => 'nullable|image|mimes:jpg,jpeg,png,webp|max:2048',
+                'department' => 'nullable|string|max:255',
+                'job_title' => 'nullable|string|max:255',
+                'specialities' => 'nullable|array',
+                'specialities.*' => 'string|max:255',
+            ]);
+
+            $user = auth()->user();
+
+            if (!$user) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unauthenticated',
+                ], 401);
+            }
+
+            $updateData = [];
+
+            /* ---------- Text & Array Fields ---------- */
+            foreach ([
+                'address',
+                'city',
+                'zip_code',
+                'department',
+                'job_title',
+                'specialities',
+            ] as $field) {
+                if ($request->has($field)) {
+                    $updateData[$field] = $validated[$field] ?? null;
+                }
+            }
+
+            /* ---------- Image Handling ---------- */
+            if ($request->hasFile('image')) {
+
+                if ($user->image && Storage::disk('public')->exists($user->image)) {
+                    Storage::disk('public')->delete($user->image);
+                }
+
+                $updateData['image'] = $request
+                    ->file('image')
+                    ->store('profile', 'public');
+            }
+
+            /* ---------- Nothing to Update ---------- */
+            if (empty($updateData)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No data provided to update',
+                ], 422);
+            }
+
+            $user->update($updateData);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Profile updated successfully',
+                'data' => new UserResource($user->fresh()),
+            ]);
+
+        } catch (\Throwable $th) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Something went wrong',
+                'error' => $th->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function changePassword(ChangePasswordRequest $request)
+    {
+        try {
+            $validated = $request->validated();
+            $user = auth()->user();
+            if (!Hash::check($validated['old_password'], $user->password)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Old password is incorrect'
+                ]);
+            }
+            $user->update([
+                'password' => bcrypt($validated['password'])
+            ]);
+            return response()->json([
+                'success' => true,
+                'message' => 'Password updated successfully'
+            ]);
+        } catch (\Throwable $th) {
+            return response()->json([
+                'success' => false,
+                'message' => $th->getMessage()
+            ]);
+        }
+    }
+
+    public function getBankAccount()
+    {
+        try {
+            $user = auth()->user();
+            $bankAccount = $user->bankAccount;
+            return response()->json([
+                'success' => true,
+                'data' => $bankAccount
+            ]);
+        } catch (\Throwable $th) {
+            return response()->json([
+                'success' => false,
+                'message' => $th->getMessage()
+            ]);
+        }
+    }
+
+    public function addBankAccount(Request $request)
+    {
+        try {
+            $user = auth()->user();
+            $bankAccount = $user->bankAccount;
+            if ($bankAccount) {
+                $bankAccount->update([
+                    'bank_name' => $request->bank_name,
+                    'account_holder_name' => $request->account_holder_name,
+                    'account_number' => $request->account_number,
+                    'routing_number' => $request->routing_number
+                ]);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Bank update successfully'
+                ]);
+            }
+            BankAccount::create([
+                'user_id' => $user->id,
+                'bank_name' => $request->bank_name,
+                'account_holder_name' => $request->account_holder_name,
+                'account_number' => $request->account_number,
+                'routing_number' => $request->routing_number
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Bank account added successfully',
+            ]);
+        } catch (\Throwable $th) {
+            return response()->json([
+                'success' => false,
+                'message' => $th->getMessage()
+            ]);
+        }
+    }
+
+    public function getWeeklySummary()
+    {
+        $userId = auth()->id();
+
+        $weekStart = now()->startOfWeek();
+        $weekEnd = now()->endOfWeek();
+
+        // Daily Entries
+        $entries = DB::table('claim_shifts')
+            ->selectRaw("
+            DATE(created_at) as entry_date,
+            DAYNAME(created_at) as day_name,
+            ROUND(TIMESTAMPDIFF(MINUTE, start_time, end_time) / 60, 2) as hours
+        ")
+            ->where('user_id', $userId)
+            ->whereBetween('created_at', [$weekStart, $weekEnd])
+            ->orderBy('created_at')
+            ->get()
+            ->map(function ($item) {
+                return [
+                    'day' => $item->day_name,
+                    'date' => \Carbon\Carbon::parse($item->entry_date)->format('M d'),
+                    'hours' => (float) $item->hours,
+                ];
+            });
+
+        // Weekly Totals
+        $weekly = DB::table('claim_shifts')
+            ->selectRaw("
+            SUM(TIMESTAMPDIFF(MINUTE, start_time, end_time)) / 60 as total_hours
+        ")
+            ->where('user_id', $userId)
+            ->whereBetween('created_at', [$weekStart, $weekEnd])
+            ->first();
+
+        $totalHours = round($weekly->total_hours ?? 0, 2);
+        $regularHours = min($totalHours, 36);
+        $overtimeHours = $totalHours > 36 ? $totalHours - 36 : 0;
+
+        return response()->json([
+            'week' => $weekStart->format('M d') . '-' . $weekEnd->format('d'),
+            'status' => 'Pending',
+            'total_hours' => $totalHours,
+            'regular_hours' => $regularHours,
+            'overtime' => $overtimeHours,
+            'days' => $entries
+        ]);
+    }
+
+    public function uploadComplianceDocument(Request $request)
+    {
+        $request->validate([
+            'type' => 'required|string|max:100',
+            'document' => 'required|file|mimes:jpg,jpeg,png,pdf,doc,docx|max:10048'
+        ]);
+
+        try {
+            DB::beginTransaction();
+
+            $userId = auth()->id();
+
+            // Check if document already exists for this user + type
+            $existing = Document::where('user_id', $userId)
+                ->where('type', $request->type)
+                ->first();
+
+            // Upload new file
+            $path = $request->file('document')->store('documents', 'public');
+
+            if ($existing) {
+
+                // Delete old file if exists
+                if ($existing->document && Storage::disk('public')->exists($existing->document)) {
+                    Storage::disk('public')->delete($existing->document);
+                }
+
+                // Update existing document
+                $existing->update([
+                    'document' => $path,
+                    'status' => 0,   // reset status if required
+                ]);
+
+                DB::commit();
+
+                return response()->json([
+                    'status' => true,
+                    'message' => 'Document updated successfully.',
+                    'data' => $existing,
+                ], 200);
+
+            } else {
+
+                // Create new document
+                $document = Document::create([
+                    'user_id' => $userId,
+                    'document' => $path,
+                    'type' => $request->type,
+                    'status' => 0,
+                ]);
+
+                DB::commit();
+
+                return response()->json([
+                    'status' => true,
+                    'message' => 'Document uploaded successfully.',
+                    'data' => $document,
+                ], 201);
+            }
+
+        } catch (Exception $th) {
+
+            DB::rollBack();
+
+            return response()->json([
+                'status' => false,
+                'message' => $th->getMessage()
+            ], 500);
+        }
+    }
+    
+    public function getComplianceDocument(Request $request)
+    {
+        try {
+            $userId = auth()->id();
+
+            $documents = Document::where('user_id', $userId)->get();
+
+            $documents->transform(function ($doc) {
+                $doc->document = Storage::url($doc->document);
+                return $doc;
+            });
+
+            return response()->json([
+                'success' => true,
+                'data' => $documents
+            ]);
+
+        } catch (\Throwable $th) {
+            return response()->json([
+                'success' => false,
+                'message' => $th->getMessage()
+            ]);
+        }
+    }
+
+
+
+}
